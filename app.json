@@ -1,0 +1,16 @@
+{
+  "expo": {
+    "name": "rns-4487-repro",
+    "slug": "rns-4487-repro",
+    "version": "1.0.0",
+    "newArchEnabled": true,
+    "main": "index.js",
+    "plugins": ["./plugins/with-parcel-logger"],
+    "android": {
+      "package": "com.example.rns4487repro"
+    },
+    "ios": {
+      "bundleIdentifier": "com.example.rns4487repro"
+    }
+  }
+}

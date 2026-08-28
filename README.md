@@ -1,93 +1,87 @@
 # rns-4487-repro
 
-Reproduction aid for **software-mansion/react-native-screens#4487**.
+Reproduction for **software-mansion/react-native-screens#4487** — under the New
+Architecture (Fabric), retained `ScreenStackFragment`s accumulate in the host
+Activity's `onSaveInstanceState` parcel and, on a deep/wide navigation tree,
+exceed the Binder transaction limit → `android.os.TransactionTooLargeException`
+on `activityStopped`.
 
-Under the New Architecture, react-native-screens mounts one native `Fragment`
-per pushed screen. On a deep push stack they accumulate in the host Activity's
-saved state, and when the app is backgrounded `onSaveInstanceState` serialises a
-parcel that — in a real app — exceeds the Binder transaction budget →
-`android.os.TransactionTooLargeException` on `activityStopped`.
+## What this repo demonstrates
 
-This is a **save-time** crash, distinct from the restore-time crashes RNS already
-handles (`AutoRemovingFragment` / `RNScreensFragmentFactory` / `super.onCreate(null)`):
-the oversized parcel is rejected by the Binder at save time, before any restore.
-
-## What this repo demonstrates (and what it does not)
-
-This minimal app **demonstrates the accumulation mechanism** — it auto-pushes a
-native-stack screen to `TARGET_DEPTH` and logs, on background, the saved-state
-parcel size and that the react-native-screens fragment payload is present:
+Set `MODE` at the top of `App.tsx` and background the app. It logs the saved-state
+parcel size from an injected `onSaveInstanceState` logger:
 
 ```
 adb logcat -s RNSRepro
 E RNSRepro: onSaveInstanceState parcel=<N> bytes | regHasFragments=true
 ```
 
-It **does not, by itself, cross the ~1 MB Binder limit and crash.** That is
-expected and worth stating plainly: with *trivial* screens the saved state per
-fragment is tiny (~75 bytes/fragment measured on API 34), so a toy stack stays
-far under the limit. The production crash is an **emergent property of real
-screens × deep navigation** — real screens save materially more per fragment
-(see the numbers below), and long sessions reach 100+ retained fragments.
+| `MODE` | structure | parcel vs depth (measured, Android 16) |
+|---|---|---|
+| `opaque` | plain push stack | **FLAT** — 3952 B at depth 3 **and** 100 |
+| `transparentModal` | opaque root + `transparentModal` stack | **LINEAR** — 8152 / 31952 / 59952 B at depth 3 / 20 / 40 |
+| `nested` | Root Stack → Bottom-Tabs → per-tab Stacks (one double-nested) + `formSheet` | 3952 (baseline) → 7176 (nested) → 8576 (nested + sheet) |
 
-The point of this repo is to show the **code path** (RNS mounts one saved
-Fragment per screen; they land under `androidx.lifecycle.BundlableSavedStateRegistry.key`
-→ `android:support:fragments`; `regHasFragments=true`) and to let you watch that
-parcel grow with depth. The crash-scale evidence is the production data below.
+### Why `opaque` is flat (and the original repro was wrong)
 
-## Production crash evidence
+For an **opaque** top screen, `ScreenStack.kt` sets `visibleBottom == null` and
+`transaction.remove()`s every fragment except the top one. A *removed* fragment is
+not serialised into `onSaveInstanceState`, so the parcel is constant regardless of
+depth — the N screens live in react-navigation's JS state, not as N saved
+fragments. A plain push stack therefore does **not** leak.
 
-Real Sentry / `TooLargeTool` breakdown from a shipping app on this exact stack
-(the parcel that actually crashed at `activityStopped`, ~639 KB):
+### Why the other modes accumulate
 
-```
-androidx.lifecycle.BundlableSavedStateRegistry.key [637 KB]
-    android:support:activity-result [208 KB]
-    android:support:fragments      [428 KB]   <- ~150 ScreenStackFragment/ScreenFragment entries
-        fragment_<uuid> [2868]
-            childFragmentManager [2176]
-                fragment_<uuid> [1752]
-                    childFragmentManager [1068]
-        ... (x150)
-```
+Fragments only accumulate when they stay `add()`-ed. RNS keeps them added for
+**translucent** presentations — `Screen.isTranslucent()` is true for
+`TRANSPARENT_MODAL` and `FORM_SHEET` — and for **nested navigators** (bottom-tabs
+keeps every visited tab's stack mounted; each mounted navigator contributes a
+retained fragment with its own `childFragmentManager`). RNS declares these
+fragments non-restorable (`AutoRemovingFragment`, `super.onCreate(null)`) and
+rebuilds from JS on restore — yet still lets their state be **saved**, which is
+the dead weight that overflows the parcel.
 
-- Device: Samsung Galaxy A57 (SM-A576B), Android 16, 7.8 GB RAM — **not** low-memory.
-- Each real fragment contributes ~2.8 KB (mostly FragmentManager metadata + the
-  nested `childFragmentManager`); at 150+ retained fragments this is 428 KB.
-
-## Environment
-
-- react-native-screens **4.18.0**
-- react-native **0.81.5**, New Architecture **ON** (Fabric)
-- Expo SDK 54, `@react-navigation/native-stack` v7 (RNS `ScreenStack` consumer)
-- androidx.fragment **1.8.9**
-- Android (arm64), Android 13+ emulator or device
+`transparentModal` fits `parcel = 3952 + 1400·depth` (R² = 1) — ≈1.4 KB per
+retained fragment with trivial screens. Real screens save materially more
+(≈2.8 KB/fragment in the app where this crashed in production), so a wide/deep
+tree of ≈150 retained fragments reaches ≈428 KB of `android:support:fragments`
+(≈639 KB total) — over the Binder limit.
 
 ## Run
 
 ```bash
 npm install
-npx expo prebuild --platform android --clean   # New Arch is enabled via app.json;
-                                                # the parcel logger is injected by
-                                                # plugins/with-parcel-logger.js
+npx expo prebuild --platform android --clean   # injects the onSaveInstanceState
+                                                # logger via plugins/with-parcel-logger.js
 npx expo run:android
 ```
 
-1. The app auto-pushes a self-referential screen to `TARGET_DEPTH` (`App.tsx`).
+1. Set `MODE` in `App.tsx` and reload.
 2. In a second terminal: `adb logcat -s RNSRepro`.
-3. When auto-push settles, enable Developer Options → **"Don't keep activities"**
-   (forces the save+stop deterministically on an emulator; production hits it via
-   natural memory pressure), then press **Home**.
-4. `RNSRepro` logs the saved-state parcel size and `regHasFragments=true`. Raise
-   `TARGET_DEPTH` (or run against real, content-heavy screens) to see it climb.
+3. When the app settles, enable Developer Options → **"Don't keep activities"**,
+   then press **Home** to background it (forces the save+stop deterministically;
+   production hits it via natural memory pressure / app switch).
+4. Read the parcel size. Switch `MODE` (and `TARGET_DEPTH`) to compare.
 
-## App-side workaround (fix vector)
+> Note: `transparentModal` and `nested` composite many layers, so a **software
+> (swiftshader) emulator** stalls past ~depth 40–50; that is an emulator limit,
+> not RNS. Use a hardware-accelerated emulator or a real device to go deeper.
 
-Stripping the fragment state in `onSaveInstanceState` stops the crash — RNS
-rebuilds the stack from JS on restore. **Gotcha:** on androidx.fragment 1.8.x the
-`FragmentManager` state is saved via `SavedStateRegistry`, so the classic top-level
-`outState.remove("android:support:fragments")` is a **no-op** (measured: 0 bytes
-removed). It must be reached inside the registry bundle:
+## Environment
+
+- react-native-screens **4.18.0**
+- react-native **0.81.5**, New Architecture **ON** (Fabric)
+- Expo SDK 54, `@react-navigation/native-stack` v7 + `@react-navigation/bottom-tabs` v7
+- androidx.fragment **1.8.9**
+- Android 13+ (measured on Android 16, emulator + real device)
+
+## App-side workaround (and the gotcha)
+
+Stripping the fragment state in `MainActivity.onSaveInstanceState` stops the crash —
+RNS rebuilds from JS. On androidx.fragment 1.8.x the `FragmentManager` state is
+saved via `SavedStateRegistry`, so the classic top-level
+`outState.remove("android:support:fragments")` is a **no-op**; it must be reached
+inside the registry bundle:
 
 ```kotlin
 override fun onSaveInstanceState(outState: Bundle) {
